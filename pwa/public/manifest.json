@@ -1,0 +1,9 @@
+{
+  "name": "Mi Cartera de Inversión",
+  "short_name": "Cartera",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#f0f4f8",
+  "theme_color": "#1a2744",
+  "icons": []
+}
