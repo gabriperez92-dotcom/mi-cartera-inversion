@@ -12,9 +12,12 @@ const defaultFunds = [
   { id: 2, name: "Fondo 2" },
 ];
 
+const defaultDistribution = { totalMensual: "", allocations: [] };
+
 export default function App() {
   const [funds, setFunds] = useState(defaultFunds);
   const [entries, setEntries] = useState([]);
+  const [distribution, setDistribution] = useState(defaultDistribution);
   const [newFundName, setNewFundName] = useState("");
   const [activeTab, setActiveTab] = useState("resumen");
   const [activeFund, setActiveFund] = useState(1);
@@ -29,21 +32,22 @@ export default function App() {
           const d = JSON.parse(r.value);
           if (d.funds) setFunds(d.funds);
           if (d.entries) setEntries(d.entries);
+          if (d.distribution) setDistribution(d.distribution);
           if (d.funds?.length) setActiveFund(d.funds[0].id);
         } catch {}
       }
     }).catch(() => {});
   }, []);
 
-  const save = useCallback(async (f, e) => {
+  const save = useCallback(async (f, e, d) => {
     try {
-      await window.storage?.set(STORAGE_KEY, JSON.stringify({ funds: f, entries: e }));
+      await window.storage?.set(STORAGE_KEY, JSON.stringify({ funds: f, entries: e, distribution: d }));
       setSaved(true);
       setTimeout(() => setSaved(false), 1500);
     } catch {}
   }, []);
 
-  const persist = (f, e) => { setFunds(f); setEntries(e); save(f, e); };
+  const persist = (f, e, d) => { setFunds(f); setEntries(e); setDistribution(d); save(f, e, d); };
 
   // Computed per fund
   const fundStats = (fid) => {
@@ -62,7 +66,7 @@ export default function App() {
     if (!newFundName.trim()) return;
     const nf = { id: Date.now(), name: newFundName.trim() };
     const nf2 = [...funds, nf];
-    persist(nf2, entries);
+    persist(nf2, entries, distribution);
     setNewFundName("");
     setActiveFund(nf.id);
     setActiveTab("aportaciones");
@@ -71,35 +75,56 @@ export default function App() {
   const removeFund = (fid) => {
     const nf = funds.filter(f => f.id !== fid);
     const ne = entries.filter(e => e.fundId !== fid);
-    persist(nf, ne);
+    persist(nf, ne, distribution);
     if (activeFund === fid && nf.length) setActiveFund(nf[0].id);
   };
 
   const renameFund = (fid, name) => {
     const nf = funds.map(f => f.id === fid ? { ...f, name } : f);
-    persist(nf, entries);
+    persist(nf, entries, distribution);
     setEditingFund(null);
   };
 
   const addEntry = (fid) => {
     const ne = [...entries, emptyEntry(fid)];
-    persist(funds, ne);
+    persist(funds, ne, distribution);
   };
 
   const updateEntry = (eid, field, val) => {
     const ne = entries.map(e => e.id === eid ? { ...e, [field]: val } : e);
-    persist(funds, ne);
+    persist(funds, ne, distribution);
   };
 
   const removeEntry = (eid) => {
     const ne = entries.filter(e => e.id !== eid);
-    persist(funds, ne);
+    persist(funds, ne, distribution);
   };
+
+  const updateDistribution = (next) => { setDistribution(next); save(funds, entries, next); };
+  const addAllocation = () => updateDistribution({ ...distribution, allocations: [...distribution.allocations, { id: Date.now(), label: "", pct: "" }] });
+  const updateAllocation = (aid, field, val) => updateDistribution({ ...distribution, allocations: distribution.allocations.map(a => a.id === aid ? { ...a, [field]: val } : a) });
+  const removeAllocation = (aid) => updateDistribution({ ...distribution, allocations: distribution.allocations.filter(a => a.id !== aid) });
 
   const activeFundEntries = entries.filter(e => e.fundId === activeFund).sort((a, b) => a.date.localeCompare(b.date));
 
   // Running totals for the entries table
   let runningAportado = 0;
+
+  // Month-over-month calculation
+  const latestPerFundMonth = {};
+  for (const e of entries) {
+    if (e.valorActual === "") continue;
+    const key = `${e.date}__${e.fundId}`;
+    if (!latestPerFundMonth[key] || e.id > latestPerFundMonth[key].id) latestPerFundMonth[key] = e;
+  }
+  const monthTotals = {};
+  for (const e of Object.values(latestPerFundMonth))
+    monthTotals[e.date] = (monthTotals[e.date] || 0) + parseFloat(e.valorActual || 0);
+  const sortedMonthKeys = Object.keys(monthTotals).sort();
+  const momCurrent = sortedMonthKeys.at(-1) != null ? monthTotals[sortedMonthKeys.at(-1)] : null;
+  const momPrev    = sortedMonthKeys.at(-2) != null ? monthTotals[sortedMonthKeys.at(-2)] : null;
+  const momDiff    = momCurrent !== null && momPrev !== null ? momCurrent - momPrev : null;
+  const momPctChg  = momPrev > 0 && momDiff !== null ? (momDiff / momPrev) * 100 : null;
 
   return (
     <div style={{ fontFamily: "system-ui, sans-serif", background: "#f0f4f8", minHeight: "100vh", padding: "16px" }}>
@@ -119,8 +144,8 @@ export default function App() {
         </div>
 
         {/* Tabs */}
-        <div style={{ display: "flex", gap: 4, marginBottom: 16 }}>
-          {[["resumen", "📋 Resumen"], ["aportaciones", "➕ Aportaciones"], ["fondos", "⚙️ Gestionar Fondos"]].map(([k, l]) => (
+        <div style={{ display: "flex", gap: 4, marginBottom: 16, flexWrap: "wrap" }}>
+          {[["resumen", "📋 Resumen"], ["aportaciones", "➕ Aportaciones"], ["fondos", "⚙️ Gestionar Fondos"], ["distribucion", "📐 Distribución"]].map(([k, l]) => (
             <button key={k} onClick={() => setActiveTab(k)} style={{
               padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600,
               background: activeTab === k ? "#3b5bdb" : "#fff", color: activeTab === k ? "#fff" : "#374151",
@@ -146,7 +171,7 @@ export default function App() {
               { label: "Rentabilidad Total", value: (pos ? "+" : "") + fmtPct(totalPct), color: pos ? "#16a34a" : "#dc2626", bg: pos ? "#f0fdf4" : "#fff1f2", icon: "📊" },
             ];
             return (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 16 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 12 }}>
                 {cards.map(c => (
                   <div key={c.label} style={{ background: c.bg, borderRadius: 12, padding: "16px 18px", boxShadow: "0 1px 4px rgba(0,0,0,0.07)" }}>
                     <div style={{ fontSize: 20, marginBottom: 4 }}>{c.icon}</div>
@@ -157,6 +182,35 @@ export default function App() {
               </div>
             );
           })()}
+
+          {/* Variación mensual */}
+          {momDiff !== null && (() => {
+            const pos = momDiff >= 0;
+            return (
+              <div style={{
+                background: pos ? "#f0fdf4" : "#fff1f2", borderRadius: 12, padding: "12px 18px",
+                marginBottom: 16, boxShadow: "0 1px 4px rgba(0,0,0,0.07)",
+                display: "flex", alignItems: "center", gap: 14
+              }}>
+                <span style={{ fontSize: 26 }}>{pos ? "📈" : "📉"}</span>
+                <div>
+                  <div style={{ fontSize: 11, color: "#64748b", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 2 }}>
+                    Variación mensual &nbsp;
+                    <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>
+                      ({sortedMonthKeys.at(-2)} → {sortedMonthKeys.at(-1)})
+                    </span>
+                  </div>
+                  <div style={{ fontSize: 20, fontWeight: 800, color: pos ? "#16a34a" : "#dc2626" }}>
+                    {pos ? "+" : ""}{fmt(momDiff)} €
+                    <span style={{ fontSize: 14, fontWeight: 600, marginLeft: 8 }}>
+                      ({pos ? "+" : ""}{fmtPct(momPctChg)})
+                    </span>
+                  </div>
+                </div>
+              </div>
+            );
+          })()}
+
           <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", overflow: "hidden" }}>
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
               <thead>
@@ -346,6 +400,125 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {/* DISTRIBUCIÓN TAB */}
+        {activeTab === "distribucion" && (
+          <div>
+            {/* Importe total mensual */}
+            <div style={{ background: "#fff", borderRadius: 12, padding: 20, marginBottom: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.08)" }}>
+              <div style={{ fontWeight: 700, color: "#1a2744", fontSize: 15, marginBottom: 10 }}>Importe mensual a invertir</div>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <input
+                  type="number" min="0" step="0.01" placeholder="0.00"
+                  value={distribution.totalMensual}
+                  onChange={e => updateDistribution({ ...distribution, totalMensual: e.target.value })}
+                  style={{ width: 150, border: "1px solid #e2e8f0", borderRadius: 8, padding: "9px 12px", fontSize: 18, fontWeight: 700, textAlign: "right", color: "#1a2744" }}
+                />
+                <span style={{ color: "#64748b", fontWeight: 600, fontSize: 16 }}>€</span>
+              </div>
+            </div>
+
+            {/* Tabla de distribución */}
+            <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", overflow: "hidden" }}>
+              <div style={{ padding: "14px 16px", borderBottom: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontWeight: 700, color: "#1a2744", fontSize: 15 }}>Distribución por concepto</span>
+                <button onClick={addAllocation} style={{
+                  background: "#3b5bdb", color: "#fff", border: "none", borderRadius: 7,
+                  padding: "7px 14px", fontSize: 13, fontWeight: 600, cursor: "pointer"
+                }}>+ Añadir concepto</button>
+              </div>
+
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+                <thead>
+                  <tr style={{ background: "#f8fafc", borderBottom: "2px solid #e2e8f0" }}>
+                    <th style={{ padding: "10px 14px", textAlign: "left", color: "#475569", fontWeight: 600, fontSize: 12 }}>Concepto</th>
+                    <th style={{ padding: "10px 14px", textAlign: "right", color: "#475569", fontWeight: 600, fontSize: 12 }}>%</th>
+                    <th style={{ padding: "10px 14px", textAlign: "right", color: "#475569", fontWeight: 600, fontSize: 12 }}>Importe</th>
+                    <th style={{ padding: "10px 14px", width: 40 }}></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {distribution.allocations.length === 0 && (
+                    <tr><td colSpan={4} style={{ textAlign: "center", padding: 32, color: "#94a3b8", fontSize: 14 }}>
+                      Haz clic en "+ Añadir concepto" para definir tu distribución.
+                    </td></tr>
+                  )}
+                  {distribution.allocations.map((a, i) => {
+                    const importe = parseFloat(distribution.totalMensual || 0) * parseFloat(a.pct || 0) / 100;
+                    const hasTotal = distribution.totalMensual !== "" && parseFloat(distribution.totalMensual) > 0;
+                    return (
+                      <tr key={a.id} style={{ borderBottom: "1px solid #f1f5f9", background: i % 2 === 0 ? "#fff" : "#fafbfc" }}>
+                        <td style={{ padding: "8px 14px" }}>
+                          <input
+                            value={a.label}
+                            onChange={e => updateAllocation(a.id, "label", e.target.value)}
+                            placeholder="Ej: S&P500, Oro, Bonos..."
+                            style={{ width: "100%", border: "1px solid #e2e8f0", borderRadius: 6, padding: "5px 10px", fontSize: 13 }}
+                          />
+                        </td>
+                        <td style={{ padding: "8px 14px", textAlign: "right" }}>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 4 }}>
+                            <input
+                              type="number" min="0" max="100" step="0.01"
+                              value={a.pct}
+                              onChange={e => updateAllocation(a.id, "pct", e.target.value)}
+                              style={{ width: 70, border: "1px solid #e2e8f0", borderRadius: 6, padding: "5px 8px", fontSize: 13, textAlign: "right" }}
+                            />
+                            <span style={{ color: "#64748b" }}>%</span>
+                          </div>
+                        </td>
+                        <td style={{ padding: "8px 14px", textAlign: "right", fontWeight: 600, color: "#1a2744", fontSize: 14 }}>
+                          {hasTotal && a.pct !== "" ? fmt(importe) + " €" : "—"}
+                        </td>
+                        <td style={{ padding: "8px 14px", textAlign: "center" }}>
+                          <button onClick={() => removeAllocation(a.id)} style={{
+                            background: "none", border: "none", cursor: "pointer", color: "#cbd5e1", fontSize: 16, padding: "2px 6px"
+                          }}>✕</button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+                {distribution.allocations.length > 0 && (() => {
+                  const sumPct = distribution.allocations.reduce((s, a) => s + parseFloat(a.pct || 0), 0);
+                  const totalImporte = parseFloat(distribution.totalMensual || 0);
+                  return (
+                    <tfoot>
+                      <tr style={{ background: "#1a2744", color: "#fff", fontWeight: 700 }}>
+                        <td style={{ padding: "12px 14px" }}>TOTAL</td>
+                        <td style={{ padding: "12px 14px", textAlign: "right" }}>{fmtPct(sumPct)}</td>
+                        <td style={{ padding: "12px 14px", textAlign: "right" }}>
+                          {distribution.totalMensual !== "" ? fmt(totalImporte) + " €" : "—"}
+                        </td>
+                        <td></td>
+                      </tr>
+                    </tfoot>
+                  );
+                })()}
+              </table>
+
+              {/* Banner de validación */}
+              {distribution.allocations.length > 0 && (() => {
+                const sumPct = distribution.allocations.reduce((s, a) => s + parseFloat(a.pct || 0), 0);
+                const ok = Math.abs(sumPct - 100) < 0.01;
+                return (
+                  <div style={{
+                    padding: "10px 16px", borderTop: "1px solid #e2e8f0",
+                    background: ok ? "#f0fdf4" : "#fff7ed",
+                    color: ok ? "#16a34a" : "#c2410c",
+                    fontWeight: 600, fontSize: 13
+                  }}>
+                    {ok
+                      ? "✓ Los porcentajes suman 100%"
+                      : `⚠ Los porcentajes suman ${fmtPct(sumPct)} (deben sumar 100%)`
+                    }
+                  </div>
+                );
+              })()}
+            </div>
+          </div>
+        )}
+
       </div>
     </div>
   );
