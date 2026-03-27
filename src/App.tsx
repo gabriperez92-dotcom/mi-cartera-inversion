@@ -17,7 +17,7 @@ const STORAGE_KEY = "investment-tracker-v1";
 const fmt = (n: number) => n.toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtPct = (n: number) => n.toFixed(2) + "%";
 
-interface Fund { id: number; name: string; }
+interface Fund { id: number; name: string; targetPct?: string; }
 interface Entry { id: number; fundId: number; date: string; aportacion: string; valorActual: string; aportadoAcumulado?: string; }
 interface Allocation { id: number; label: string; pct: string; }
 interface Distribution { totalMensual: string; allocations: Allocation[]; }
@@ -93,6 +93,11 @@ export default function App() {
   };
 
   const totalCartera = funds.reduce((s, f) => s + fundStats(f.id).valorActual, 0);
+
+  const updateFundTarget = (fid: number, targetPct: string) => {
+    const nf = funds.map(f => f.id === fid ? { ...f, targetPct } : f);
+    persist(nf, entries, distribution);
+  };
 
   const addFund = () => {
     if (!newFundName.trim()) return;
@@ -206,7 +211,7 @@ export default function App() {
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 4, marginBottom: 16, flexWrap: "wrap" }}>
-          {([["resumen", "📋 Resumen"], ["aportaciones", "➕ Aportaciones"], ["fondos", "⚙️ Gestionar Fondos"], ["distribucion", "📐 Distribución"]] as [string, string][]).map(([k, l]) => (
+          {([["resumen", "📋 Resumen"], ["aportaciones", "➕ Aportaciones"], ["fondos", "⚙️ Gestionar Fondos"], ["distribucion", "📐 Distribución"], ["graficas", "📈 Gráficas"]] as [string, string][]).map(([k, l]) => (
             <button key={k} onClick={() => setActiveTab(k)} style={{
               padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600,
               background: activeTab === k ? "#3b5bdb" : "#fff", color: activeTab === k ? "#fff" : "#374151",
@@ -585,6 +590,167 @@ export default function App() {
             </div>
           </div>
         )}
+
+        {/* GRÁFICAS TAB */}
+        {activeTab === "graficas" && (() => {
+          const COLORS = ["#3b5bdb","#16a34a","#f59e0b","#ef4444","#8b5cf6","#06b6d4","#f97316","#ec4899"];
+          const fundMV: Record<number, Record<string, {val: number; id: number}>> = {};
+          for (const e of entries) {
+            if (e.valorActual === "") continue;
+            if (!fundMV[e.fundId]) fundMV[e.fundId] = {};
+            if (!fundMV[e.fundId][e.date] || e.id > fundMV[e.fundId][e.date].id)
+              fundMV[e.fundId][e.date] = { val: parseFloat(e.valorActual), id: e.id };
+          }
+          const allMonths = Object.keys(monthTotals).sort();
+          const W = 580, H = 250, mL = 70, mR = 16, mT = 16, mB = 36;
+          const pW = W - mL - mR, pH = H - mT - mB;
+          const vals = allMonths.map(m => monthTotals[m]);
+          const minV = vals.length ? Math.min(...vals) * 0.92 : 0;
+          const maxV = vals.length ? Math.max(...vals) * 1.05 : 1;
+          const xS = (i: number) => mL + (allMonths.length > 1 ? i / (allMonths.length - 1) * pW : pW / 2);
+          const yS = (v: number) => mT + pH - (v - minV) / (maxV - minV || 1) * pH;
+          const totalPts = allMonths.map((m, i) => `${xS(i)},${yS(monthTotals[m])}`).join(" ");
+          const fundLines = funds.map((f, fi) => {
+            const fv = fundMV[f.id] || {};
+            const segments: string[] = []; let seg: string[] = [];
+            for (let i = 0; i < allMonths.length; i++) {
+              if (fv[allMonths[i]]) seg.push(`${xS(i)},${yS(fv[allMonths[i]].val)}`);
+              else if (seg.length) { segments.push(seg.join(" ")); seg = []; }
+            }
+            if (seg.length) segments.push(seg.join(" "));
+            return { f, color: COLORS[fi % COLORS.length], segments };
+          });
+          const donutFunds = funds.map((f, fi) => ({ ...f, val: fundStats(f.id).valorActual, color: COLORS[fi % COLORS.length] })).filter(f => f.val > 0);
+          const donutTotal = donutFunds.reduce((s, f) => s + f.val, 0);
+          const arc = (sa: number, ea: number, R=108, r=58, cx=130, cy=130) => {
+            const rd = (a: number) => (a - 90) * Math.PI / 180;
+            const x1=cx+R*Math.cos(rd(sa)),y1=cy+R*Math.sin(rd(sa));
+            const x2=cx+R*Math.cos(rd(ea)),y2=cy+R*Math.sin(rd(ea));
+            const x3=cx+r*Math.cos(rd(ea)),y3=cy+r*Math.sin(rd(ea));
+            const x4=cx+r*Math.cos(rd(sa)),y4=cy+r*Math.sin(rd(sa));
+            return `M${x1} ${y1} A${R} ${R} 0 ${ea-sa>180?1:0} 1 ${x2} ${y2} L${x3} ${y3} A${r} ${r} 0 ${ea-sa>180?1:0} 0 ${x4} ${y4}Z`;
+          };
+          let cum = 0;
+          const slices = donutFunds.map(f => {
+            const pct = f.val / donutTotal * 100; const a = pct / 100 * 360;
+            const path = arc(cum + 0.4, cum + a - 0.4); cum += a;
+            return { ...f, pct, path };
+          });
+          return (
+            <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+              <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", padding: 20 }}>
+                <h3 style={{ margin: "0 0 14px", color: "#1a2744", fontSize: 15 }}>Evolución de la cartera</h3>
+                {allMonths.length < 2
+                  ? <p style={{ color: "#94a3b8", textAlign: "center", padding: "24px 0" }}>Necesitas al menos 2 meses de datos.</p>
+                  : <div style={{ overflowX: "auto" }}>
+                      <svg width={W} height={H} style={{ display: "block", minWidth: W }}>
+                        {[0,0.25,0.5,0.75,1].map(t => {
+                          const y = mT + t * pH; const v = minV + (1 - t) * (maxV - minV);
+                          return <g key={t}>
+                            <line x1={mL} y1={y} x2={mL+pW} y2={y} stroke="#f1f5f9" strokeWidth={1}/>
+                            <text x={mL-6} y={y+4} textAnchor="end" fontSize={10} fill="#94a3b8">{v >= 1000 ? `${(v/1000).toFixed(0)}k` : v.toFixed(0)}</text>
+                          </g>;
+                        })}
+                        {allMonths.map((m, i) => {
+                          if (allMonths.length > 12 && i % Math.ceil(allMonths.length/12) !== 0) return null;
+                          return <text key={m} x={xS(i)} y={H-mB+14} textAnchor="middle" fontSize={10} fill="#94a3b8">{m.slice(2)}</text>;
+                        })}
+                        <line x1={mL} y1={mT} x2={mL} y2={mT+pH} stroke="#e2e8f0"/>
+                        <line x1={mL} y1={mT+pH} x2={mL+pW} y2={mT+pH} stroke="#e2e8f0"/>
+                        {fundLines.map(({f, color, segments}) => segments.map((pts, si) =>
+                          <polyline key={`${f.id}-${si}`} points={pts} fill="none" stroke={color} strokeWidth={1.5} opacity={0.65}/>
+                        ))}
+                        <polyline points={totalPts} fill="none" stroke="#1a2744" strokeWidth={2.5}/>
+                        {allMonths.map((m, i) => <circle key={m} cx={xS(i)} cy={yS(monthTotals[m])} r={3} fill="#1a2744"/>)}
+                      </svg>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: "4px 14px", marginTop: 6, paddingLeft: mL }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                          <div style={{ width: 18, height: 3, background: "#1a2744", borderRadius: 2 }}/><span style={{ fontSize: 11, color: "#475569" }}>Total</span>
+                        </div>
+                        {fundLines.map(({f, color}) =>
+                          <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                            <div style={{ width: 18, height: 2, background: color, borderRadius: 2, opacity: 0.8 }}/><span style={{ fontSize: 11, color: "#475569" }}>{f.name}</span>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                }
+              </div>
+              <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", padding: 20 }}>
+                <h3 style={{ margin: "0 0 14px", color: "#1a2744", fontSize: 15 }}>Distribución actual vs objetivo</h3>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 24, alignItems: "flex-start" }}>
+                  <div style={{ flexShrink: 0 }}>
+                    {donutTotal === 0
+                      ? <p style={{ color: "#94a3b8", padding: 32 }}>Sin datos.</p>
+                      : <svg width={260} height={260}>
+                          {slices.map(s => <path key={s.id} d={s.path} fill={s.color} opacity={0.85}/>)}
+                          <text x={130} y={123} textAnchor="middle" fontSize={12} fill="#64748b">Total</text>
+                          <text x={130} y={141} textAnchor="middle" fontSize={14} fontWeight="bold" fill="#1a2744">{fmt(donutTotal)}€</text>
+                        </svg>
+                    }
+                  </div>
+                  <div style={{ flex: 1, minWidth: 260, overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                      <thead>
+                        <tr style={{ borderBottom: "2px solid #e2e8f0" }}>
+                          {["Fondo","Valor actual","Peso real","Objetivo %","Diferencia"].map(h =>
+                            <th key={h} style={{ padding: "8px 10px", textAlign: h==="Fondo"?"left":"right", color: "#475569", fontWeight: 600, fontSize: 12 }}>{h}</th>
+                          )}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {funds.map((f, fi) => {
+                          const s = fundStats(f.id);
+                          const real = donutTotal > 0 ? s.valorActual / donutTotal * 100 : 0;
+                          const target = parseFloat(f.targetPct || "0");
+                          const diff = real - target;
+                          const hasT = f.targetPct !== "" && f.targetPct != null;
+                          return (
+                            <tr key={f.id} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                              <td style={{ padding: "8px 10px" }}>
+                                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                  <div style={{ width: 10, height: 10, borderRadius: "50%", background: COLORS[fi % COLORS.length] }}/>
+                                  {f.name}
+                                </div>
+                              </td>
+                              <td style={{ padding: "8px 10px", textAlign: "right", color: "#475569" }}>{fmt(s.valorActual)} €</td>
+                              <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 600, color: "#1a2744" }}>{fmtPct(real)}</td>
+                              <td style={{ padding: "8px 10px", textAlign: "right" }}>
+                                <input type="number" min="0" max="100" step="0.1" placeholder="0.0"
+                                  value={f.targetPct ?? ""}
+                                  onChange={ev => updateFundTarget(f.id, ev.target.value)}
+                                  style={{ width: 60, border: "1px solid #e2e8f0", borderRadius: 6, padding: "3px 6px", fontSize: 12, textAlign: "right" }}/>
+                                <span style={{ fontSize: 12, color: "#94a3b8", marginLeft: 3 }}>%</span>
+                              </td>
+                              <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: hasT?600:400,
+                                color: !hasT?"#94a3b8":Math.abs(diff)<1?"#16a34a":diff>0?"#dc2626":"#3b5bdb" }}>
+                                {hasT ? (diff >= 0 ? "+" : "") + fmtPct(diff) : "—"}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                      {funds.some(f => f.targetPct !== "" && f.targetPct != null) && (() => {
+                        const sumT = funds.reduce((s, f) => s + parseFloat(f.targetPct || "0"), 0);
+                        return (
+                          <tfoot>
+                            <tr style={{ borderTop: "2px solid #e2e8f0", background: "#f8fafc", fontWeight: 700 }}>
+                              <td style={{ padding: "8px 10px", color: "#1a2744" }}>TOTAL</td>
+                              <td style={{ padding: "8px 10px", textAlign: "right", color: "#475569" }}>{fmt(donutTotal)} €</td>
+                              <td style={{ padding: "8px 10px", textAlign: "right", color: "#1a2744" }}>100%</td>
+                              <td style={{ padding: "8px 10px", textAlign: "right", color: Math.abs(sumT-100)<0.1?"#16a34a":"#f59e0b", fontWeight: 700 }}>{fmtPct(sumT)}</td>
+                              <td/>
+                            </tr>
+                          </tfoot>
+                        );
+                      })()}
+                    </table>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
       </div>
     </div>
