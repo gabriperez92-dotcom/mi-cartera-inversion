@@ -60,8 +60,16 @@ export default function App() {
 
   // Computed per fund
   const fundStats = (fid) => {
-    const fe = entries.filter(e => e.fundId === fid && e.aportacion !== "" && e.valorActual !== "");
-    const totalAportado = fe.reduce((s, e) => s + parseFloat(e.aportacion || 0), 0);
+    const fe = entries.filter(e => e.fundId === fid && e.aportacion !== "" && e.valorActual !== "")
+      .sort((a, b) => a.date.localeCompare(b.date));
+    let running = 0;
+    for (let i = 0; i < fe.length; i++) {
+      const calc = i === 0 ? parseFloat(fe[i].aportacion || 0) : running + parseFloat(fe[i].aportacion || 0);
+      running = fe[i].aportadoAcumulado !== "" && fe[i].aportadoAcumulado != null
+        ? parseFloat(fe[i].aportadoAcumulado)
+        : calc;
+    }
+    const totalAportado = running;
     const lastEntry = fe[fe.length - 1];
     const valorActual = lastEntry ? parseFloat(lastEntry.valorActual || 0) : 0;
     const beneficio = valorActual - totalAportado;
@@ -378,7 +386,9 @@ export default function App() {
                   {activeFundEntries.map((e, i) => {
                     const ap = parseFloat(e.aportacion || 0);
                     const va = parseFloat(e.valorActual || 0);
-                    runningAportado = i === 0 ? ap : runningAportado + ap;
+                    const calcAportado = i === 0 ? ap : runningAportado + ap;
+                    const hasManual = e.aportadoAcumulado !== "" && e.aportadoAcumulado != null;
+                    runningAportado = hasManual ? parseFloat(e.aportadoAcumulado) : calcAportado;
                     const ben = va - runningAportado;
                     const pct = runningAportado > 0 ? (ben / runningAportado) * 100 : 0;
                     const pos = ben >= 0;
@@ -394,8 +404,12 @@ export default function App() {
                             onChange={ev => updateEntry(e.id, "aportacion", ev.target.value)}
                             style={{ width: 80, border: "1px solid #e2e8f0", borderRadius: 6, padding: "4px 6px", fontSize: 12, textAlign: "right" }} />
                         </td>
-                        <td style={{ padding: "8px 8px", textAlign: "right", color: "#64748b", fontSize: 13 }}>
-                          {hasData ? fmt(runningAportado) : "—"}
+                        <td style={{ padding: "8px 8px", textAlign: "right" }}>
+                          <input type="number" step="0.01" placeholder={hasData ? String(calcAportado.toFixed(2)) : "—"}
+                            value={e.aportadoAcumulado ?? ""}
+                            onChange={ev => updateEntry(e.id, "aportadoAcumulado", ev.target.value)}
+                            title="Déjalo vacío para calcular automáticamente"
+                            style={{ width: 90, border: hasManual ? "1px solid #3b5bdb" : "1px solid #e2e8f0", borderRadius: 6, padding: "4px 6px", fontSize: 12, textAlign: "right", color: hasManual ? "#3b5bdb" : "#64748b", background: hasManual ? "#eff6ff" : "#fff" }} />
                         </td>
                         <td style={{ padding: "8px 8px", textAlign: "right" }}>
                           <input type="number" min="0" step="0.01" placeholder="0.00" value={e.valorActual}
