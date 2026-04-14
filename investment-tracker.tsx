@@ -24,6 +24,8 @@ export default function App() {
   const [editingFund, setEditingFund] = useState(null);
   const [saved, setSaved] = useState(false);
   const [storageError, setStorageError] = useState(false);
+  // quotes: { [fundId]: { loading?, error?, symbol?, price?, change?, changePct?, currency? } }
+  const [quotes, setQuotes] = useState({});
 
   // Load from storage
   useEffect(() => {
@@ -31,7 +33,7 @@ export default function App() {
       if (r?.value) {
         try {
           const d = JSON.parse(r.value);
-          if (d.funds) setFunds(d.funds);
+          if (d.funds) { setFunds(d.funds); d.funds.filter(f => f.isin?.trim()).forEach(f => fetchQuote(f)); }
           if (d.entries) setEntries(d.entries);
           if (d.distribution) setDistribution(d.distribution);
           if (d.funds?.length) setActiveFund(d.funds[0].id);
@@ -46,6 +48,42 @@ export default function App() {
 
     // Escuchar errores de guardado
     window.storage?.onSaveError?.(() => setStorageError(true));
+  }, []);
+
+  // ── Cotizaciones diarias ───────────────────────────────────────────────────
+  const fetchQuote = useCallback(async (fund) => {
+    const isin = fund.isin?.trim();
+    if (!isin) return;
+    setQuotes(q => ({ ...q, [fund.id]: { loading: true } }));
+    try {
+      let result;
+      if ((window as any).quotes?.fetch) {
+        // Electron: el proceso principal hace la petición (sin restricciones CORS)
+        result = await (window as any).quotes.fetch(isin);
+      } else {
+        // PWA: intento directo desde el navegador
+        const sr = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(isin)}&quotesCount=5&newsCount=0&enableFuzzyQuery=false`);
+        const sd = await sr.json();
+        let symbol: string = sd?.quotes?.[0]?.symbol;
+        if (!symbol) symbol = isin.toUpperCase();
+        const cr = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`);
+        const cd = await cr.json();
+        const meta = cd?.chart?.result?.[0]?.meta;
+        if (!meta?.regularMarketPrice) { setQuotes(q => ({ ...q, [fund.id]: { error: "no_data" } })); return; }
+        const price = meta.regularMarketPrice;
+        const prevClose = meta.previousClose ?? meta.chartPreviousClose;
+        const change = prevClose ? price - prevClose : 0;
+        const changePct = prevClose ? (change / prevClose) * 100 : 0;
+        result = { symbol, price, change, changePct, currency: meta.currency ?? "EUR" };
+      }
+      if (result?.error) {
+        setQuotes(q => ({ ...q, [fund.id]: { error: result.error } }));
+      } else {
+        setQuotes(q => ({ ...q, [fund.id]: { ...result, loading: false } }));
+      }
+    } catch {
+      setQuotes(q => ({ ...q, [fund.id]: { error: "cors" } }));
+    }
   }, []);
 
   const save = useCallback(async (f, e, d) => {
@@ -105,6 +143,13 @@ export default function App() {
     const nf = funds.map(f => f.id === fid ? { ...f, name } : f);
     persist(nf, entries, distribution);
     setEditingFund(null);
+  };
+
+  const updateFundIsin = (fid, isin) => {
+    const nf = funds.map(f => f.id === fid ? { ...f, isin } : f);
+    persist(nf, entries, distribution);
+    if (isin.trim()) fetchQuote({ id: fid, isin });
+    else setQuotes(q => { const n = { ...q }; delete n[fid]; return n; });
   };
 
   const addEntry = (fid) => {
@@ -272,6 +317,16 @@ export default function App() {
           })()}
 
           <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)" }}>
+            {funds.some(f => f.isin?.trim()) && (
+              <div style={{ padding: "10px 14px", borderBottom: "1px solid #e2e8f0", display: "flex", justifyContent: "flex-end" }}>
+                <button
+                  onClick={() => funds.filter(f => f.isin?.trim()).forEach(f => fetchQuote(f))}
+                  style={{ background: "none", border: "1px solid #e2e8f0", borderRadius: 7, padding: "5px 12px", fontSize: 12, color: "#475569", cursor: "pointer" }}
+                >
+                  ↺ Actualizar cotizaciones
+                </button>
+              </div>
+            )}
             <div className="inv-table-scroll">
             <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14, minWidth: 560 }}>
               <thead>
@@ -281,6 +336,7 @@ export default function App() {
                   <th style={{ padding: "12px 10px", textAlign: "right", fontWeight: 600, fontSize: 12 }}>Valor (€)</th>
                   <th style={{ padding: "12px 10px", textAlign: "right", fontWeight: 600, fontSize: 12 }}>Benef/Pérd. (€)</th>
                   <th style={{ padding: "12px 10px", textAlign: "right", fontWeight: 600, fontSize: 12 }}>Rentab.</th>
+                  <th style={{ padding: "12px 10px", textAlign: "right", fontWeight: 600, fontSize: 12 }}>Hoy</th>
                   <th style={{ padding: "12px 10px", textAlign: "right", fontWeight: 600, fontSize: 12 }}>% Cartera</th>
                 </tr>
               </thead>
@@ -299,6 +355,20 @@ export default function App() {
                       </td>
                       <td style={{ padding: "11px 10px", textAlign: "right", color: pos ? "#16a34a" : "#dc2626", fontWeight: 600 }}>
                         {pos ? "+" : ""}{fmtPct(s.pct)}
+                      </td>
+                      <td style={{ padding: "11px 10px", textAlign: "right", fontWeight: 600, fontSize: 13 }}>
+                        {(() => {
+                          const q = quotes[f.id];
+                          if (!f.isin?.trim()) return <span style={{ color: "#cbd5e1" }}>—</span>;
+                          if (!q || q.loading) return <span style={{ color: "#94a3b8", fontSize: 11 }}>···</span>;
+                          if (q.error) return <span style={{ color: "#f59e0b", fontSize: 11 }} title={q.error}>✗</span>;
+                          const up = q.changePct >= 0;
+                          return (
+                            <span style={{ color: up ? "#16a34a" : "#dc2626" }} title={`${q.symbol} · ${fmt(q.price)} ${q.currency}`}>
+                              {up ? "▲" : "▼"} {up ? "+" : ""}{q.changePct.toFixed(2)}%
+                            </span>
+                          );
+                        })()}
                       </td>
                       <td style={{ padding: "11px 10px", textAlign: "right" }}>
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8 }}>
@@ -328,6 +398,7 @@ export default function App() {
                       return (p >= 0 ? "+" : "") + fmtPct(p);
                     })()}
                   </td>
+                  <td style={{ padding: "12px 10px", textAlign: "right" }}>—</td>
                   <td style={{ padding: "12px 10px", textAlign: "right" }}>100%</td>
                 </tr>
               </tfoot>
@@ -448,17 +519,41 @@ export default function App() {
             <h3 style={{ margin: "0 0 16px", color: "#1a2744", fontSize: 15 }}>Mis Fondos</h3>
             <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 24 }}>
               {funds.map(f => (
-                <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: "#f8fafc", borderRadius: 8, border: "1px solid #e2e8f0" }}>
-                  {editingFund === f.id ? (
-                    <input autoFocus defaultValue={f.name}
-                      onBlur={e => renameFund(f.id, e.target.value)}
-                      onKeyDown={e => e.key === "Enter" && renameFund(f.id, e.target.value)}
-                      style={{ flex: 1, border: "1px solid #3b5bdb", borderRadius: 6, padding: "4px 10px", fontSize: 14 }} />
-                  ) : (
-                    <span style={{ flex: 1, fontWeight: 600, color: "#1a2744" }}>{f.name}</span>
-                  )}
-                  <button onClick={() => setEditingFund(f.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#64748b", fontSize: 13, padding: "4px 8px" }}>✏️ Renombrar</button>
-                  <button onClick={() => removeFund(f.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#ef4444", fontSize: 13, padding: "4px 8px" }}>🗑️ Eliminar</button>
+                <div key={f.id} style={{ background: "#f8fafc", borderRadius: 8, border: "1px solid #e2e8f0", padding: "10px 14px" }}>
+                  {/* Fila nombre */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    {editingFund === f.id ? (
+                      <input autoFocus defaultValue={f.name}
+                        onBlur={e => renameFund(f.id, e.target.value)}
+                        onKeyDown={e => e.key === "Enter" && renameFund(f.id, e.target.value)}
+                        style={{ flex: 1, border: "1px solid #3b5bdb", borderRadius: 6, padding: "4px 10px", fontSize: 14 }} />
+                    ) : (
+                      <span style={{ flex: 1, fontWeight: 600, color: "#1a2744" }}>{f.name}</span>
+                    )}
+                    <button onClick={() => setEditingFund(f.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#64748b", fontSize: 13, padding: "4px 8px" }}>✏️ Renombrar</button>
+                    <button onClick={() => removeFund(f.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#ef4444", fontSize: 13, padding: "4px 8px" }}>🗑️ Eliminar</button>
+                  </div>
+                  {/* Fila ISIN */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+                    <span style={{ fontSize: 12, color: "#64748b", fontWeight: 600, minWidth: 34 }}>ISIN</span>
+                    <input
+                      value={f.isin || ""}
+                      onChange={e => updateFundIsin(f.id, e.target.value)}
+                      placeholder="Ej: ES0174118009 o BTC-USD"
+                      style={{ width: 200, border: "1px solid #e2e8f0", borderRadius: 6, padding: "4px 10px", fontSize: 12, color: "#1a2744" }}
+                    />
+                    {(() => {
+                      const q = quotes[f.id];
+                      if (!f.isin?.trim()) return null;
+                      if (!q || q.loading) return <span style={{ fontSize: 12, color: "#94a3b8" }}>⟳ buscando…</span>;
+                      if (q.error) return <span style={{ fontSize: 12, color: "#f59e0b" }} title={q.error}>✗ no encontrado</span>;
+                      return (
+                        <span style={{ fontSize: 12, color: "#16a34a", fontWeight: 600 }}>
+                          ✓ {q.symbol} · {q.changePct >= 0 ? "+" : ""}{q.changePct.toFixed(2)}% hoy
+                        </span>
+                      );
+                    })()}
+                  </div>
                 </div>
               ))}
             </div>
