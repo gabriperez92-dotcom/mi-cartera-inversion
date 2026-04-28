@@ -193,6 +193,36 @@ export default function App() {
   const momDiff    = momCurrent !== null && momPrev !== null ? momCurrent - momPrev : null;
   const momPctChg  = momPrev > 0 && momDiff !== null ? (momDiff / momPrev) * 100 : null;
 
+  // Histórico mensual: aportado acumulado por fondo por mes
+  const fundAportadoByMonth: Record<number, Record<string, number>> = {};
+  for (const f of funds) {
+    const fe = entries
+      .filter(e => e.fundId === f.id && e.aportacion !== "")
+      .sort((a, b) => a.date.localeCompare(b.date));
+    let running = 0;
+    fundAportadoByMonth[f.id] = {};
+    for (const e of fe) {
+      const calc = running + parseFloat(e.aportacion || 0);
+      running = (e.aportadoAcumulado !== "" && e.aportadoAcumulado != null)
+        ? parseFloat(e.aportadoAcumulado) : calc;
+      fundAportadoByMonth[f.id][e.date] = running;
+    }
+  }
+  const monthAportadoAcumulado: Record<string, number> = {};
+  const monthAportacionNueva: Record<string, number> = {};
+  for (const m of sortedMonthKeys) {
+    let total = 0;
+    for (const f of funds) {
+      const fMonths = Object.keys(fundAportadoByMonth[f.id] || {}).filter(fm => fm <= m).sort();
+      if (fMonths.length) total += fundAportadoByMonth[f.id][fMonths.at(-1)!];
+    }
+    monthAportadoAcumulado[m] = total;
+  }
+  for (const e of entries) {
+    if (e.aportacion === "") continue;
+    monthAportacionNueva[e.date] = (monthAportacionNueva[e.date] || 0) + parseFloat(e.aportacion || 0);
+  }
+
   return (
     <div style={{ fontFamily: "system-ui, sans-serif", background: "#f0f4f8", minHeight: "100vh", padding: "16px" }}>
       <style>{`
@@ -250,7 +280,7 @@ export default function App() {
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 4, marginBottom: 16, flexWrap: "wrap" }}>
-          {[["resumen", "📋 Resumen"], ["aportaciones", "➕ Aportaciones"], ["fondos", "⚙️ Gestionar Fondos"], ["distribucion", "📐 Distribución"], ["graficas", "📈 Gráficas"]].map(([k, l]) => (
+          {[["resumen", "📋 Resumen"], ["historico", "📅 Histórico"], ["aportaciones", "➕ Aportaciones"], ["fondos", "⚙️ Gestionar Fondos"], ["distribucion", "📐 Distribución"], ["graficas", "📈 Gráficas"]].map(([k, l]) => (
             <button key={k} onClick={() => setActiveTab(k)} style={{
               padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600,
               background: activeTab === k ? "#3b5bdb" : "#fff", color: activeTab === k ? "#fff" : "#374151",
@@ -410,6 +440,65 @@ export default function App() {
               </div>
             )}
           </div>
+          </div>
+        )}
+
+        {/* HISTÓRICO TAB */}
+        {activeTab === "historico" && (
+          <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", padding: 20 }}>
+            <h3 style={{ margin: "0 0 14px", color: "#1a2744", fontSize: 15 }}>Histórico mensual</h3>
+            {sortedMonthKeys.length === 0
+              ? <p style={{ color: "#94a3b8", textAlign: "center", padding: "24px 0" }}>Sin datos todavía.</p>
+              : <div className="inv-table-scroll">
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 680 }}>
+                    <thead>
+                      <tr style={{ borderBottom: "2px solid #e2e8f0" }}>
+                        {["Mes", "Valor total", "Aportado acumulado", "Beneficio €", "Rentabilidad", "Ganancia mercado", "Rent. mes"].map(h =>
+                          <th key={h} style={{ padding: "8px 10px", textAlign: h === "Mes" ? "left" : "right", color: "#475569", fontWeight: 600, fontSize: 12, whiteSpace: "nowrap" }}>{h}</th>
+                        )}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...sortedMonthKeys].reverse().map((m, idx) => {
+                        const revIdx = sortedMonthKeys.length - 1 - idx;
+                        const prevM = revIdx > 0 ? sortedMonthKeys[revIdx - 1] : null;
+                        const valor = monthTotals[m] || 0;
+                        const aportado = monthAportadoAcumulado[m] || 0;
+                        const beneficio = valor - aportado;
+                        const rentPct = aportado > 0 ? (beneficio / aportado) * 100 : 0;
+                        const prevValor = prevM ? (monthTotals[prevM] || 0) : null;
+                        const ganMercado = prevValor !== null
+                          ? (valor - prevValor) - (monthAportacionNueva[m] || 0)
+                          : null;
+                        const rentMesPct = prevValor && prevValor > 0 && ganMercado !== null
+                          ? (ganMercado / prevValor) * 100
+                          : null;
+                        const benPos = beneficio >= 0;
+                        const ganPos = ganMercado !== null ? ganMercado >= 0 : true;
+                        return (
+                          <tr key={m} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                            <td style={{ padding: "8px 10px", fontWeight: 600, color: "#1a2744", whiteSpace: "nowrap" }}>{m.slice(0, 4)}/{m.slice(5, 7)}</td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", color: "#475569" }}>{fmt(valor)} €</td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", color: "#475569" }}>{fmt(aportado)} €</td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 600, color: benPos ? "#16a34a" : "#dc2626" }}>
+                              {(benPos ? "+" : "") + fmt(beneficio)} €
+                            </td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 600, color: benPos ? "#16a34a" : "#dc2626" }}>
+                              {(benPos ? "+" : "") + fmtPct(rentPct)}
+                            </td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 600, color: ganPos ? "#16a34a" : "#dc2626" }}>
+                              {ganMercado !== null ? (ganPos ? "+" : "") + fmt(ganMercado) + " €" : "—"}
+                            </td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 600, color: ganPos ? "#16a34a" : "#dc2626" }}>
+                              {rentMesPct !== null ? (rentMesPct >= 0 ? "+" : "") + fmtPct(rentMesPct) : "—"}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+            }
           </div>
         )}
 
@@ -705,8 +794,9 @@ export default function App() {
           const W = 580, H = 250, mL = 70, mR = 16, mT = 16, mB = 36;
           const pW = W - mL - mR, pH = H - mT - mB;
           const vals = allMonths.map(m => monthTotals[m]);
-          const minV = vals.length ? Math.min(...vals) * 0.92 : 0;
-          const maxV = vals.length ? Math.max(...vals) * 1.05 : 1;
+          const allFundVals = Object.values(fundMV).flatMap(fv => Object.values(fv as Record<string, {val:number;id:number}>).map(v => v.val));
+          const minV = 0;
+          const maxV = (vals.length || allFundVals.length) ? Math.max(...vals, ...allFundVals, 1) * 1.05 : 1;
           const xS = i => mL + (allMonths.length > 1 ? i / (allMonths.length - 1) * pW : pW / 2);
           const yS = v => mT + pH - (v - minV) / (maxV - minV || 1) * pH;
           const totalPts = allMonths.map((m, i) => `${xS(i)},${yS(monthTotals[m])}`).join(" ");
