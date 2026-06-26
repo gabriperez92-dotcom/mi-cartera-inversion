@@ -9,7 +9,23 @@ declare global {
       reauth?: () => Promise<{ ok: boolean }>;
       onSaveError?: (cb: () => void) => void;
     };
+    quotes?: {
+      fetch: (isinOrTicker: string) => Promise<QuoteResult>;
+    };
   }
+}
+
+interface QuoteResult {
+  symbol?: string;
+  price?: number;
+  change?: number;
+  changePct?: number;
+  currency?: string;
+  error?: string;
+}
+
+interface QuoteState extends QuoteResult {
+  loading?: boolean;
 }
 
 const STORAGE_KEY = "investment-tracker-v1";
@@ -17,12 +33,16 @@ const STORAGE_KEY = "investment-tracker-v1";
 const fmt = (n: number) => n.toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtPct = (n: number) => n.toFixed(2) + "%";
 
-interface Fund { id: number; name: string; targetPct?: string; }
+interface Fund { id: number; name: string; targetPct?: string; isin?: string; }
 interface Entry { id: number; fundId: number; date: string; aportacion: string; valorActual: string; aportadoAcumulado?: string; }
 interface Allocation { id: number; label: string; pct: string; }
 interface Distribution { totalMensual: string; allocations: Allocation[]; }
 
-const emptyEntry = (fundId: number): Entry => ({ id: Date.now(), fundId, date: new Date().toISOString().slice(0, 7), aportacion: "", valorActual: "" });
+// IDs únicos y monótonos crecientes (evita colisiones de Date.now() en el mismo ms)
+let _lastId = 0;
+const newId = () => (_lastId = Math.max(Date.now(), _lastId + 1));
+
+const emptyEntry = (fundId: number): Entry => ({ id: newId(), fundId, date: new Date().toISOString().slice(0, 7), aportacion: "", valorActual: "" });
 
 const defaultFunds: Fund[] = [
   { id: 1, name: "Fondo 1" },
@@ -41,6 +61,41 @@ export default function App() {
   const [editingFund, setEditingFund] = useState<number | null>(null);
   const [saved, setSaved] = useState(false);
   const [storageError, setStorageError] = useState(false);
+  const [quotes, setQuotes] = useState<Record<number, QuoteState>>({});
+
+  // ── Cotizaciones diarias ───────────────────────────────────────────────────
+  const fetchQuote = useCallback(async (fund: Fund) => {
+    const isin = fund.isin?.trim();
+    if (!isin) return;
+    setQuotes(q => ({ ...q, [fund.id]: { loading: true } }));
+    try {
+      let result: QuoteResult;
+      if (window.quotes?.fetch) {
+        result = await window.quotes.fetch(isin);
+      } else {
+        const sr = await fetch(`https://query1.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(isin)}&quotesCount=5&newsCount=0&enableFuzzyQuery=false`);
+        const sd = await sr.json() as { quotes?: { symbol: string }[] };
+        let symbol: string = sd?.quotes?.[0]?.symbol ?? "";
+        if (!symbol) symbol = isin.toUpperCase();
+        const cr = await fetch(`https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=5d`);
+        const cd = await cr.json() as { chart?: { result?: { meta?: { regularMarketPrice?: number; previousClose?: number; chartPreviousClose?: number; currency?: string } }[] } };
+        const meta = cd?.chart?.result?.[0]?.meta;
+        if (!meta?.regularMarketPrice) { setQuotes(q => ({ ...q, [fund.id]: { error: "no_data" } })); return; }
+        const price = meta.regularMarketPrice;
+        const prevClose = meta.previousClose ?? meta.chartPreviousClose;
+        const change = prevClose ? price - prevClose : 0;
+        const changePct = prevClose ? (change / prevClose) * 100 : 0;
+        result = { symbol, price, change, changePct, currency: meta.currency ?? "EUR" };
+      }
+      if (result?.error) {
+        setQuotes(q => ({ ...q, [fund.id]: { error: result.error } }));
+      } else {
+        setQuotes(q => ({ ...q, [fund.id]: { ...result, loading: false } }));
+      }
+    } catch {
+      setQuotes(q => ({ ...q, [fund.id]: { error: "cors" } }));
+    }
+  }, []);
 
   // Load from storage
   useEffect(() => {
@@ -48,7 +103,7 @@ export default function App() {
       if (r?.value) {
         try {
           const d = JSON.parse(r.value) as { funds?: Fund[]; entries?: Entry[]; distribution?: Distribution };
-          if (d.funds) setFunds(d.funds);
+          if (d.funds) { setFunds(d.funds); d.funds.filter(f => f.isin?.trim()).forEach(f => fetchQuote(f)); }
           if (d.entries) setEntries(d.entries);
           if (d.distribution) setDistribution(d.distribution);
           if (d.funds?.length) setActiveFund(d.funds[0].id);
@@ -73,19 +128,30 @@ export default function App() {
 
   const persist = (f: Fund[], e: Entry[], d: Distribution) => { setFunds(f); setEntries(e); setDistribution(d); void save(f, e, d); };
 
+  // Serie de aportado acumulado por fondo (filas con aportación o con override manual),
+  // honrando el override. Reutilizada por fundStats y por el histórico mensual.
+  const aportadoSeries = (fid: number) => {
+    const fe = entries
+      .filter(e => e.fundId === fid && (e.aportacion !== "" || (e.aportadoAcumulado != null && e.aportadoAcumulado !== "")))
+      .sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id);
+    const byDate: Record<string, number> = {};
+    let running = 0;
+    for (const e of fe) {
+      const calc = running + parseFloat(e.aportacion || "0");
+      running = (e.aportadoAcumulado != null && e.aportadoAcumulado !== "")
+        ? parseFloat(e.aportadoAcumulado) : calc;
+      byDate[e.date] = running;
+    }
+    return { total: running, byDate };
+  };
+
   // Computed per fund
   const fundStats = (fid: number) => {
-    const fe = entries.filter(e => e.fundId === fid && e.aportacion !== "" && e.valorActual !== "")
-      .sort((a, b) => a.date.localeCompare(b.date));
-    let running = 0;
-    for (let i = 0; i < fe.length; i++) {
-      const calc = i === 0 ? parseFloat(fe[i].aportacion || "0") : running + parseFloat(fe[i].aportacion || "0");
-      running = fe[i].aportadoAcumulado !== "" && fe[i].aportadoAcumulado != null
-        ? parseFloat(fe[i].aportadoAcumulado!)
-        : calc;
-    }
-    const totalAportado = running;
-    const lastEntry = fe[fe.length - 1];
+    const totalAportado = aportadoSeries(fid).total;
+    // Valor actual = última fila con valor (por fecha, desempate por id), aunque no tenga aportación
+    const ve = entries.filter(e => e.fundId === fid && e.valorActual !== "")
+      .sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id);
+    const lastEntry = ve[ve.length - 1];
     const valorActual = lastEntry ? parseFloat(lastEntry.valorActual || "0") : 0;
     const beneficio = valorActual - totalAportado;
     const pct = totalAportado > 0 ? (beneficio / totalAportado) * 100 : 0;
@@ -101,7 +167,7 @@ export default function App() {
 
   const addFund = () => {
     if (!newFundName.trim()) return;
-    const nf: Fund = { id: Date.now(), name: newFundName.trim() };
+    const nf: Fund = { id: newId(), name: newFundName.trim() };
     const nf2 = [...funds, nf];
     persist(nf2, entries, distribution);
     setNewFundName("");
@@ -122,6 +188,13 @@ export default function App() {
     setEditingFund(null);
   };
 
+  const updateFundIsin = (fid: number, isin: string) => {
+    const nf = funds.map(f => f.id === fid ? { ...f, isin } : f);
+    persist(nf, entries, distribution);
+    if (isin.trim()) fetchQuote({ id: fid, name: "", isin });
+    else setQuotes(q => { const n = { ...q }; delete n[fid]; return n; });
+  };
+
   const addEntry = (fid: number) => {
     const ne = [...entries, emptyEntry(fid)];
     persist(funds, ne, distribution);
@@ -138,7 +211,7 @@ export default function App() {
   };
 
   const updateDistribution = (next: Distribution) => { setDistribution(next); void save(funds, entries, next); };
-  const addAllocation = () => updateDistribution({ ...distribution, allocations: [...distribution.allocations, { id: Date.now(), label: "", pct: "" }] });
+  const addAllocation = () => updateDistribution({ ...distribution, allocations: [...distribution.allocations, { id: newId(), label: "", pct: "" }] });
   const updateAllocation = (aid: number, field: keyof Allocation, val: string) => updateDistribution({ ...distribution, allocations: distribution.allocations.map(a => a.id === aid ? { ...a, [field]: val } as Allocation : a) });
   const removeAllocation = (aid: number) => updateDistribution({ ...distribution, allocations: distribution.allocations.filter(a => a.id !== aid) });
 
@@ -147,24 +220,94 @@ export default function App() {
   // Running totals for the entries table
   let runningAportado = 0;
 
-  // Month-over-month calculation
-  const latestPerFundMonth: Record<string, Entry> = {};
-  for (const e of entries) {
-    if (e.valorActual === "") continue;
-    const key = `${e.date}__${e.fundId}`;
-    if (!latestPerFundMonth[key] || e.id > latestPerFundMonth[key].id) latestPerFundMonth[key] = e;
+  // ── Series mensuales compartidas (resumen, histórico, gráficas) ────────────
+  // Valor registrado por fondo y mes (última entrada con valor de ese mes)
+  const fundValorByMonth: Record<number, Record<string, number>> = {};
+  const valorMonthsSet = new Set<string>();
+  {
+    const latest: Record<string, { val: number; id: number }> = {};
+    for (const e of entries) {
+      if (e.valorActual === "") continue;
+      valorMonthsSet.add(e.date);
+      const key = `${e.fundId}__${e.date}`;
+      if (!latest[key] || e.id > latest[key].id) latest[key] = { val: parseFloat(e.valorActual || "0"), id: e.id };
+    }
+    for (const key in latest) {
+      const [fid, date] = key.split("__");
+      (fundValorByMonth[+fid] ||= {})[date] = latest[key].val;
+    }
   }
+  const sortedMonthKeys = [...valorMonthsSet].sort();
+
+  // Aportado acumulado por fondo y mes (reutiliza el helper aportadoSeries)
+  const fundAportadoByMonth: Record<number, Record<string, number>> = {};
+  for (const f of funds) fundAportadoByMonth[f.id] = aportadoSeries(f.id).byDate;
+
+  // Valor / aportado de la cartera por mes, arrastrando el último dato conocido por fondo
+  const valorAsOf = (fid: number, m: string) => {
+    const ms = Object.keys(fundValorByMonth[fid] || {}).filter(d => d <= m).sort();
+    return ms.length ? fundValorByMonth[fid][ms.at(-1)!] : null;
+  };
+  const aportadoAsOf = (fid: number, m: string) => {
+    const ms = Object.keys(fundAportadoByMonth[fid] || {}).filter(d => d <= m).sort();
+    return ms.length ? fundAportadoByMonth[fid][ms.at(-1)!] : 0;
+  };
   const monthTotals: Record<string, number> = {};
-  for (const e of Object.values(latestPerFundMonth))
-    monthTotals[e.date] = (monthTotals[e.date] ?? 0) + parseFloat(e.valorActual || "0");
-  const sortedMonthKeys = Object.keys(monthTotals).sort();
-  const momCurrent = sortedMonthKeys.at(-1) != null ? monthTotals[sortedMonthKeys.at(-1)!] : null;
-  const momPrev    = sortedMonthKeys.at(-2) != null ? monthTotals[sortedMonthKeys.at(-2)!] : null;
-  const momDiff    = momCurrent !== null && momPrev !== null ? momCurrent - momPrev : null;
-  const momPctChg  = momPrev !== null && momPrev > 0 && momDiff !== null ? (momDiff / momPrev) * 100 : null;
+  const monthAportadoAcumulado: Record<string, number> = {};
+  for (const m of sortedMonthKeys) {
+    let v = 0, a = 0;
+    for (const f of funds) { const vv = valorAsOf(f.id, m); if (vv !== null) v += vv; a += aportadoAsOf(f.id, m); }
+    monthTotals[m] = v;
+    monthAportadoAcumulado[m] = a;
+  }
+
+  // Aportaciones nuevas por mes (para separar mercado de aportes)
+  const monthAportacionNueva: Record<string, number> = {};
+  for (const e of entries) {
+    if (e.aportacion === "") continue;
+    monthAportacionNueva[e.date] = (monthAportacionNueva[e.date] || 0) + parseFloat(e.aportacion || "0");
+  }
+
+  // Filas mensuales centralizadas (histórico + variación mensual + TWR)
+  const monthlyRows = sortedMonthKeys.map((m, i) => {
+    const prevM = i > 0 ? sortedMonthKeys[i - 1] : null;
+    const valor = monthTotals[m] || 0;
+    const aportado = monthAportadoAcumulado[m] || 0;
+    const beneficio = valor - aportado;
+    const rentPct = aportado > 0 ? (beneficio / aportado) * 100 : 0;
+    const prevValor = prevM ? (monthTotals[prevM] || 0) : null;
+    const ganMercado = prevValor !== null ? (valor - prevValor) - (monthAportacionNueva[m] || 0) : null;
+    const rentMesPct = prevValor !== null && prevValor > 0 && ganMercado !== null ? (ganMercado / prevValor) * 100 : null;
+    return { month: m, valor, aportado, beneficio, rentPct, ganMercado, rentMesPct };
+  });
+
+  // Variación mensual = solo ganancia de mercado del último mes
+  const lastRow = monthlyRows.at(-1);
+  const momMarketDiff = lastRow ? lastRow.ganMercado : null;
+  const momMarketPct  = lastRow ? lastRow.rentMesPct : null;
+
+  // Rentabilidad time-weighted (TWR): encadena los rendimientos mensuales de mercado
+  let twrFactor = 1, twrPeriods = 0;
+  for (const r of monthlyRows) {
+    if (r.rentMesPct === null) continue;
+    twrFactor *= 1 + r.rentMesPct / 100;
+    twrPeriods++;
+  }
+  const twrAcum  = twrPeriods > 0 ? (twrFactor - 1) * 100 : null;
+  const twrAnual = twrPeriods > 0 ? (Math.pow(twrFactor, 12 / twrPeriods) - 1) * 100 : null;
 
   return (
     <div style={{ fontFamily: "system-ui, sans-serif", background: "#f0f4f8", minHeight: "100vh", padding: "16px" }}>
+      <style>{`
+        .inv-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 12px; }
+        .inv-table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+        .inv-table-scroll::-webkit-scrollbar { height: 6px; }
+        .inv-table-scroll::-webkit-scrollbar-track { background: #f1f5f9; }
+        .inv-table-scroll::-webkit-scrollbar-thumb { background: #94a3b8; border-radius: 3px; }
+        @media (max-width: 640px) {
+          .inv-cards { grid-template-columns: repeat(2, 1fr); }
+        }
+      `}</style>
       <div style={{ maxWidth: 900, margin: "0 auto" }}>
         {/* Header */}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
@@ -211,7 +354,7 @@ export default function App() {
 
         {/* Tabs */}
         <div style={{ display: "flex", gap: 4, marginBottom: 16, flexWrap: "wrap" }}>
-          {([["resumen", "📋 Resumen"], ["aportaciones", "➕ Aportaciones"], ["fondos", "⚙️ Gestionar Fondos"], ["distribucion", "📐 Distribución"], ["graficas", "📈 Gráficas"]] as [string, string][]).map(([k, l]) => (
+          {([["resumen", "📋 Resumen"], ["historico", "📅 Histórico"], ["aportaciones", "➕ Aportaciones"], ["fondos", "⚙️ Gestionar Fondos"], ["distribucion", "📐 Distribución"], ["graficas", "📈 Gráficas"]] as [string, string][]).map(([k, l]) => (
             <button key={k} onClick={() => setActiveTab(k)} style={{
               padding: "8px 16px", borderRadius: 8, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600,
               background: activeTab === k ? "#3b5bdb" : "#fff", color: activeTab === k ? "#fff" : "#374151",
@@ -237,7 +380,7 @@ export default function App() {
               { label: "Rentabilidad Total", value: (pos ? "+" : "") + fmtPct(totalPct), color: pos ? "#16a34a" : "#dc2626", bg: pos ? "#f0fdf4" : "#fff1f2", icon: "📊" },
             ];
             return (
-              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 12 }}>
+              <div className="inv-cards">
                 {cards.map(c => (
                   <div key={c.label} style={{ background: c.bg, borderRadius: 12, padding: "16px 18px", boxShadow: "0 1px 4px rgba(0,0,0,0.07)" }}>
                     <div style={{ fontSize: 20, marginBottom: 4 }}>{c.icon}</div>
@@ -249,9 +392,9 @@ export default function App() {
             );
           })()}
 
-          {/* Variación mensual */}
-          {momDiff !== null && (() => {
-            const pos = momDiff >= 0;
+          {/* Variación mensual (solo ganancia de mercado, sin contar aportaciones) */}
+          {momMarketDiff !== null && (() => {
+            const pos = momMarketDiff >= 0;
             return (
               <div style={{
                 background: pos ? "#f0fdf4" : "#fff1f2", borderRadius: 12, padding: "12px 18px",
@@ -261,27 +404,61 @@ export default function App() {
                 <span style={{ fontSize: 26 }}>{pos ? "📈" : "📉"}</span>
                 <div>
                   <div style={{ fontSize: 11, color: "#64748b", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 2 }}>
-                    Variación mensual &nbsp;
+                    Variación mensual (mercado) &nbsp;
                     <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>
                       ({sortedMonthKeys.at(-2)} → {sortedMonthKeys.at(-1)})
                     </span>
                   </div>
                   <div style={{ fontSize: 20, fontWeight: 800, color: pos ? "#16a34a" : "#dc2626" }}>
-                    {pos ? "+" : ""}{fmt(momDiff)} €
-                    <span style={{ fontSize: 14, fontWeight: 600, marginLeft: 8 }}>
-                      ({pos ? "+" : ""}{fmtPct(momPctChg ?? 0)})
-                    </span>
+                    {pos ? "+" : ""}{fmt(momMarketDiff)} €
+                    {momMarketPct !== null && (
+                      <span style={{ fontSize: 14, fontWeight: 600, marginLeft: 8 }}>
+                        ({pos ? "+" : ""}{fmtPct(momMarketPct)})
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>
             );
           })()}
 
-          <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", overflow: "hidden" }}>
-            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+          {/* Rentabilidad time-weighted (independiente de las aportaciones) */}
+          {twrAcum !== null && (
+            <div style={{
+              background: "#fff", borderRadius: 12, padding: "12px 18px", marginBottom: 16,
+              boxShadow: "0 1px 4px rgba(0,0,0,0.07)", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap"
+            }}>
+              <span style={{ fontSize: 26 }}>⏱️</span>
+              <div>
+                <div style={{ fontSize: 11, color: "#64748b", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 2 }}>
+                  Rentabilidad de mercado (TWR)
+                </div>
+                <div style={{ fontSize: 18, fontWeight: 800, color: twrAcum >= 0 ? "#16a34a" : "#dc2626" }}>
+                  {twrAcum >= 0 ? "+" : ""}{fmtPct(twrAcum)}
+                  <span style={{ fontSize: 13, fontWeight: 600, color: "#64748b", marginLeft: 10 }}>
+                    acumulada · anualizada {twrAnual! >= 0 ? "+" : ""}{fmtPct(twrAnual!)}
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
+
+          <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)" }}>
+            {funds.some(f => f.isin?.trim()) && (
+              <div style={{ padding: "10px 14px", borderBottom: "1px solid #e2e8f0", display: "flex", justifyContent: "flex-end" }}>
+                <button
+                  onClick={() => funds.filter(f => f.isin?.trim()).forEach(f => fetchQuote(f))}
+                  style={{ background: "none", border: "1px solid #e2e8f0", borderRadius: 7, padding: "5px 12px", fontSize: 12, color: "#475569", cursor: "pointer" }}
+                >
+                  ↺ Actualizar cotizaciones
+                </button>
+              </div>
+            )}
+            <div className="inv-table-scroll">
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14, minWidth: 560 }}>
               <thead>
                 <tr style={{ background: "#1a2744", color: "#fff" }}>
-                  {["Fondo", "Total Aportado (€)", "Valor Actual (€)", "Beneficio/Pérdida (€)", "Rentabilidad", "% Cartera"].map(h => (
+                  {["Fondo", "Total Aportado (€)", "Valor Actual (€)", "Beneficio/Pérdida (€)", "Rentabilidad", "Hoy", "% Cartera"].map(h => (
                     <th key={h} style={{ padding: "12px 14px", textAlign: h === "Fondo" ? "left" : "right", fontWeight: 600, fontSize: 12 }}>{h}</th>
                   ))}
                 </tr>
@@ -291,6 +468,7 @@ export default function App() {
                   const s = fundStats(f.id);
                   const pctCartera = totalCartera > 0 ? (s.valorActual / totalCartera) * 100 : 0;
                   const pos = s.beneficio >= 0;
+                  const q = quotes[f.id];
                   return (
                     <tr key={f.id} style={{ background: i % 2 === 0 ? "#fff" : "#f8fafc", borderBottom: "1px solid #e2e8f0" }}>
                       <td style={{ padding: "11px 14px", fontWeight: 600, color: "#1a2744" }}>{f.name}</td>
@@ -301,6 +479,15 @@ export default function App() {
                       </td>
                       <td style={{ padding: "11px 14px", textAlign: "right", color: pos ? "#16a34a" : "#dc2626", fontWeight: 600 }}>
                         {pos ? "+" : ""}{fmtPct(s.pct)}
+                      </td>
+                      <td style={{ padding: "11px 14px", textAlign: "right", fontWeight: 600, fontSize: 13 }}>
+                        {!f.isin?.trim() ? <span style={{ color: "#cbd5e1" }}>—</span>
+                          : !q || q.loading ? <span style={{ color: "#94a3b8", fontSize: 11 }}>···</span>
+                          : q.error ? <span style={{ color: "#f59e0b", fontSize: 11 }} title={q.error}>✗</span>
+                          : <span style={{ color: (q.changePct ?? 0) >= 0 ? "#16a34a" : "#dc2626" }} title={`${q.symbol} · ${fmt(q.price ?? 0)} ${q.currency}`}>
+                              {(q.changePct ?? 0) >= 0 ? "▲" : "▼"} {(q.changePct ?? 0) >= 0 ? "+" : ""}{(q.changePct ?? 0).toFixed(2)}%
+                            </span>
+                        }
                       </td>
                       <td style={{ padding: "11px 14px", textAlign: "right" }}>
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8 }}>
@@ -330,16 +517,64 @@ export default function App() {
                       return (p >= 0 ? "+" : "") + fmtPct(p);
                     })()}
                   </td>
+                  <td style={{ padding: "12px 14px", textAlign: "right" }}>—</td>
                   <td style={{ padding: "12px 14px", textAlign: "right" }}>100%</td>
                 </tr>
               </tfoot>
             </table>
+            </div>
             {funds.every(f => fundStats(f.id).totalAportado === 0) && (
               <div style={{ textAlign: "center", padding: "32px", color: "#94a3b8", fontSize: 14 }}>
                 Aún no hay datos. Ve a <strong>Aportaciones</strong> para empezar a registrar.
               </div>
             )}
           </div>
+          </div>
+        )}
+
+        {/* HISTÓRICO TAB */}
+        {activeTab === "historico" && (
+          <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", padding: 20 }}>
+            <h3 style={{ margin: "0 0 14px", color: "#1a2744", fontSize: 15 }}>Histórico mensual</h3>
+            {sortedMonthKeys.length === 0
+              ? <p style={{ color: "#94a3b8", textAlign: "center", padding: "24px 0" }}>Sin datos todavía.</p>
+              : <div className="inv-table-scroll">
+                  <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13, minWidth: 680 }}>
+                    <thead>
+                      <tr style={{ borderBottom: "2px solid #e2e8f0" }}>
+                        {["Mes", "Valor total", "Aportado acumulado", "Beneficio €", "Rentabilidad", "Ganancia mercado", "Rent. mes"].map(h =>
+                          <th key={h} style={{ padding: "8px 10px", textAlign: h === "Mes" ? "left" : "right", color: "#475569", fontWeight: 600, fontSize: 12, whiteSpace: "nowrap" }}>{h}</th>
+                        )}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {[...monthlyRows].reverse().map(({ month: m, valor, aportado, beneficio, rentPct, ganMercado, rentMesPct }) => {
+                        const benPos = beneficio >= 0;
+                        const ganPos = ganMercado !== null ? ganMercado >= 0 : true;
+                        return (
+                          <tr key={m} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                            <td style={{ padding: "8px 10px", fontWeight: 600, color: "#1a2744", whiteSpace: "nowrap" }}>{m.slice(0, 4)}/{m.slice(5, 7)}</td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", color: "#475569" }}>{fmt(valor)} €</td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", color: "#475569" }}>{fmt(aportado)} €</td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 600, color: benPos ? "#16a34a" : "#dc2626" }}>
+                              {(benPos ? "+" : "") + fmt(beneficio)} €
+                            </td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 600, color: benPos ? "#16a34a" : "#dc2626" }}>
+                              {(benPos ? "+" : "") + fmtPct(rentPct)}
+                            </td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 600, color: ganPos ? "#16a34a" : "#dc2626" }}>
+                              {ganMercado !== null ? (ganPos ? "+" : "") + fmt(ganMercado) + " €" : "—"}
+                            </td>
+                            <td style={{ padding: "8px 10px", textAlign: "right", fontWeight: 600, color: ganPos ? "#16a34a" : "#dc2626" }}>
+                              {rentMesPct !== null ? (rentMesPct >= 0 ? "+" : "") + fmtPct(rentMesPct) : "—"}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+            }
           </div>
         )}
 
@@ -359,7 +594,7 @@ export default function App() {
               ))}
             </div>
 
-            <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", overflow: "hidden" }}>
+            <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)" }}>
               <div style={{ padding: "14px 16px", borderBottom: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <span style={{ fontWeight: 700, color: "#1a2744", fontSize: 15 }}>
                   {funds.find(f => f.id === activeFund)?.name}
@@ -370,7 +605,8 @@ export default function App() {
                 }}>+ Nueva Aportación</button>
               </div>
 
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14 }}>
+              <div className="inv-table-scroll">
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 14, minWidth: 560 }}>
                 <thead>
                   <tr style={{ background: "#f8fafc", borderBottom: "2px solid #e2e8f0" }}>
                     {["Mes/Año", "Aportación (€)", "Aportado Acum. (€)", "Valor Actual (€)", "Benef./Pérd. (€)", "Rentab.", ""].map(h => (
@@ -433,6 +669,7 @@ export default function App() {
                   })}
                 </tbody>
               </table>
+              </div>
             </div>
           </div>
         )}
@@ -443,17 +680,35 @@ export default function App() {
             <h3 style={{ margin: "0 0 16px", color: "#1a2744", fontSize: 15 }}>Mis Fondos</h3>
             <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 24 }}>
               {funds.map(f => (
-                <div key={f.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: "#f8fafc", borderRadius: 8, border: "1px solid #e2e8f0" }}>
-                  {editingFund === f.id ? (
-                    <input autoFocus defaultValue={f.name}
-                      onBlur={e => renameFund(f.id, e.target.value)}
-                      onKeyDown={e => e.key === "Enter" && renameFund(f.id, (e.target as HTMLInputElement).value)}
-                      style={{ flex: 1, border: "1px solid #3b5bdb", borderRadius: 6, padding: "4px 10px", fontSize: 14 }} />
-                  ) : (
-                    <span style={{ flex: 1, fontWeight: 600, color: "#1a2744" }}>{f.name}</span>
-                  )}
-                  <button onClick={() => setEditingFund(f.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#64748b", fontSize: 13, padding: "4px 8px" }}>✏️ Renombrar</button>
-                  <button onClick={() => removeFund(f.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#ef4444", fontSize: 13, padding: "4px 8px" }}>🗑️ Eliminar</button>
+                <div key={f.id} style={{ background: "#f8fafc", borderRadius: 8, border: "1px solid #e2e8f0", padding: "10px 14px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    {editingFund === f.id ? (
+                      <input autoFocus defaultValue={f.name}
+                        onBlur={e => renameFund(f.id, e.target.value)}
+                        onKeyDown={e => e.key === "Enter" && renameFund(f.id, (e.target as HTMLInputElement).value)}
+                        style={{ flex: 1, border: "1px solid #3b5bdb", borderRadius: 6, padding: "4px 10px", fontSize: 14 }} />
+                    ) : (
+                      <span style={{ flex: 1, fontWeight: 600, color: "#1a2744" }}>{f.name}</span>
+                    )}
+                    <button onClick={() => setEditingFund(f.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#64748b", fontSize: 13, padding: "4px 8px" }}>✏️ Renombrar</button>
+                    <button onClick={() => removeFund(f.id)} style={{ background: "none", border: "none", cursor: "pointer", color: "#ef4444", fontSize: 13, padding: "4px 8px" }}>🗑️ Eliminar</button>
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+                    <span style={{ fontSize: 12, color: "#64748b", fontWeight: 600, minWidth: 34 }}>ISIN</span>
+                    <input
+                      value={f.isin ?? ""}
+                      onChange={e => updateFundIsin(f.id, e.target.value)}
+                      placeholder="Ej: ES0174118009 o BTC-USD"
+                      style={{ width: 200, border: "1px solid #e2e8f0", borderRadius: 6, padding: "4px 10px", fontSize: 12, color: "#1a2744" }}
+                    />
+                    {(() => {
+                      const q = quotes[f.id];
+                      if (!f.isin?.trim()) return null;
+                      if (!q || q.loading) return <span style={{ fontSize: 12, color: "#94a3b8" }}>⟳ buscando…</span>;
+                      if (q.error) return <span style={{ fontSize: 12, color: "#f59e0b" }} title={q.error}>✗ no encontrado</span>;
+                      return <span style={{ fontSize: 12, color: "#16a34a", fontWeight: 600 }}>✓ {q.symbol} · {(q.changePct ?? 0) >= 0 ? "+" : ""}{(q.changePct ?? 0).toFixed(2)}% hoy</span>;
+                    })()}
+                  </div>
                 </div>
               ))}
             </div>
@@ -491,7 +746,7 @@ export default function App() {
             </div>
 
             {/* Tabla de distribución */}
-            <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)", overflow: "hidden" }}>
+            <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)" }}>
               <div style={{ padding: "14px 16px", borderBottom: "1px solid #e2e8f0", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <span style={{ fontWeight: 700, color: "#1a2744", fontSize: 15 }}>Distribución por concepto</span>
                 <button onClick={addAllocation} style={{
@@ -594,27 +849,21 @@ export default function App() {
         {/* GRÁFICAS TAB */}
         {activeTab === "graficas" && (() => {
           const COLORS = ["#3b5bdb","#16a34a","#f59e0b","#ef4444","#8b5cf6","#06b6d4","#f97316","#ec4899"];
-          const fundMV: Record<number, Record<string, {val: number; id: number}>> = {};
-          for (const e of entries) {
-            if (e.valorActual === "") continue;
-            if (!fundMV[e.fundId]) fundMV[e.fundId] = {};
-            if (!fundMV[e.fundId][e.date] || e.id > fundMV[e.fundId][e.date].id)
-              fundMV[e.fundId][e.date] = { val: parseFloat(e.valorActual), id: e.id };
-          }
-          const allMonths = Object.keys(monthTotals).sort();
+          const allMonths = sortedMonthKeys;
           const W = 580, H = 250, mL = 70, mR = 16, mT = 16, mB = 36;
           const pW = W - mL - mR, pH = H - mT - mB;
           const vals = allMonths.map(m => monthTotals[m]);
-          const minV = vals.length ? Math.min(...vals) * 0.92 : 0;
-          const maxV = vals.length ? Math.max(...vals) * 1.05 : 1;
+          const allFundVals = Object.values(fundValorByMonth).flatMap(fv => Object.values(fv));
+          const minV = 0;
+          const maxV = (vals.length || allFundVals.length) ? Math.max(...vals, ...allFundVals, 1) * 1.05 : 1;
           const xS = (i: number) => mL + (allMonths.length > 1 ? i / (allMonths.length - 1) * pW : pW / 2);
           const yS = (v: number) => mT + pH - (v - minV) / (maxV - minV || 1) * pH;
           const totalPts = allMonths.map((m, i) => `${xS(i)},${yS(monthTotals[m])}`).join(" ");
           const fundLines = funds.map((f, fi) => {
-            const fv = fundMV[f.id] || {};
+            const fv = fundValorByMonth[f.id] || {};
             const segments: string[] = []; let seg: string[] = [];
             for (let i = 0; i < allMonths.length; i++) {
-              if (fv[allMonths[i]]) seg.push(`${xS(i)},${yS(fv[allMonths[i]].val)}`);
+              if (allMonths[i] in fv) seg.push(`${xS(i)},${yS(fv[allMonths[i]])}`);
               else if (seg.length) { segments.push(seg.join(" ")); seg = []; }
             }
             if (seg.length) segments.push(seg.join(" "));

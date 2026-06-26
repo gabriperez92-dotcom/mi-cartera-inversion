@@ -5,7 +5,11 @@ const STORAGE_KEY = "investment-tracker-v1";
 const fmt = (n) => n.toLocaleString("es-ES", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtPct = (n) => n.toFixed(2) + "%";
 
-const emptyEntry = (fundId) => ({ id: Date.now(), fundId, date: new Date().toISOString().slice(0, 7), aportacion: "", valorActual: "" });
+// IDs únicos y monótonos crecientes (evita colisiones de Date.now() en el mismo ms)
+let _lastId = 0;
+const newId = () => (_lastId = Math.max(Date.now(), _lastId + 1));
+
+const emptyEntry = (fundId) => ({ id: newId(), fundId, date: new Date().toISOString().slice(0, 7), aportacion: "", valorActual: "" });
 
 const defaultFunds = [
   { id: 1, name: "Fondo 1" },
@@ -96,19 +100,30 @@ export default function App() {
 
   const persist = (f, e, d) => { setFunds(f); setEntries(e); setDistribution(d); save(f, e, d); };
 
+  // Serie de aportado acumulado por fondo (filas con aportación o con override manual),
+  // honrando el override. Reutilizada por fundStats y por el histórico mensual.
+  const aportadoSeries = (fid) => {
+    const fe = entries
+      .filter(e => e.fundId === fid && (e.aportacion !== "" || (e.aportadoAcumulado != null && e.aportadoAcumulado !== "")))
+      .sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id);
+    const byDate = {};
+    let running = 0;
+    for (const e of fe) {
+      const calc = running + parseFloat(e.aportacion || 0);
+      running = (e.aportadoAcumulado != null && e.aportadoAcumulado !== "")
+        ? parseFloat(e.aportadoAcumulado) : calc;
+      byDate[e.date] = running;
+    }
+    return { total: running, byDate };
+  };
+
   // Computed per fund
   const fundStats = (fid) => {
-    const fe = entries.filter(e => e.fundId === fid && e.aportacion !== "" && e.valorActual !== "")
-      .sort((a, b) => a.date.localeCompare(b.date));
-    let running = 0;
-    for (let i = 0; i < fe.length; i++) {
-      const calc = i === 0 ? parseFloat(fe[i].aportacion || 0) : running + parseFloat(fe[i].aportacion || 0);
-      running = fe[i].aportadoAcumulado !== "" && fe[i].aportadoAcumulado != null
-        ? parseFloat(fe[i].aportadoAcumulado)
-        : calc;
-    }
-    const totalAportado = running;
-    const lastEntry = fe[fe.length - 1];
+    const totalAportado = aportadoSeries(fid).total;
+    // Valor actual = última fila con valor (por fecha, desempate por id), aunque no tenga aportación
+    const ve = entries.filter(e => e.fundId === fid && e.valorActual !== "")
+      .sort((a, b) => a.date.localeCompare(b.date) || a.id - b.id);
+    const lastEntry = ve[ve.length - 1];
     const valorActual = lastEntry ? parseFloat(lastEntry.valorActual || 0) : 0;
     const beneficio = valorActual - totalAportado;
     const pct = totalAportado > 0 ? (beneficio / totalAportado) * 100 : 0;
@@ -124,7 +139,7 @@ export default function App() {
 
   const addFund = () => {
     if (!newFundName.trim()) return;
-    const nf = { id: Date.now(), name: newFundName.trim() };
+    const nf = { id: newId(), name: newFundName.trim() };
     const nf2 = [...funds, nf];
     persist(nf2, entries, distribution);
     setNewFundName("");
@@ -168,7 +183,7 @@ export default function App() {
   };
 
   const updateDistribution = (next) => { setDistribution(next); save(funds, entries, next); };
-  const addAllocation = () => updateDistribution({ ...distribution, allocations: [...distribution.allocations, { id: Date.now(), label: "", pct: "" }] });
+  const addAllocation = () => updateDistribution({ ...distribution, allocations: [...distribution.allocations, { id: newId(), label: "", pct: "" }] });
   const updateAllocation = (aid, field, val) => updateDistribution({ ...distribution, allocations: distribution.allocations.map(a => a.id === aid ? { ...a, [field]: val } : a) });
   const removeAllocation = (aid) => updateDistribution({ ...distribution, allocations: distribution.allocations.filter(a => a.id !== aid) });
 
@@ -177,51 +192,81 @@ export default function App() {
   // Running totals for the entries table
   let runningAportado = 0;
 
-  // Month-over-month calculation
-  const latestPerFundMonth = {};
-  for (const e of entries) {
-    if (e.valorActual === "") continue;
-    const key = `${e.date}__${e.fundId}`;
-    if (!latestPerFundMonth[key] || e.id > latestPerFundMonth[key].id) latestPerFundMonth[key] = e;
+  // ── Series mensuales compartidas (resumen, histórico, gráficas) ────────────
+  // Valor registrado por fondo y mes (última entrada con valor de ese mes)
+  const fundValorByMonth: Record<number, Record<string, number>> = {};
+  const valorMonthsSet = new Set<string>();
+  {
+    const latest: Record<string, { val: number; id: number }> = {};
+    for (const e of entries) {
+      if (e.valorActual === "") continue;
+      valorMonthsSet.add(e.date);
+      const key = `${e.fundId}__${e.date}`;
+      if (!latest[key] || e.id > latest[key].id) latest[key] = { val: parseFloat(e.valorActual || 0), id: e.id };
+    }
+    for (const key in latest) {
+      const [fid, date] = key.split("__");
+      (fundValorByMonth[+fid] ||= {})[date] = latest[key].val;
+    }
   }
-  const monthTotals = {};
-  for (const e of Object.values(latestPerFundMonth))
-    monthTotals[e.date] = (monthTotals[e.date] || 0) + parseFloat(e.valorActual || 0);
-  const sortedMonthKeys = Object.keys(monthTotals).sort();
-  const momCurrent = sortedMonthKeys.at(-1) != null ? monthTotals[sortedMonthKeys.at(-1)] : null;
-  const momPrev    = sortedMonthKeys.at(-2) != null ? monthTotals[sortedMonthKeys.at(-2)] : null;
-  const momDiff    = momCurrent !== null && momPrev !== null ? momCurrent - momPrev : null;
-  const momPctChg  = momPrev > 0 && momDiff !== null ? (momDiff / momPrev) * 100 : null;
+  const sortedMonthKeys = [...valorMonthsSet].sort();
 
-  // Histórico mensual: aportado acumulado por fondo por mes
+  // Aportado acumulado por fondo y mes (reutiliza el helper aportadoSeries)
   const fundAportadoByMonth: Record<number, Record<string, number>> = {};
-  for (const f of funds) {
-    const fe = entries
-      .filter(e => e.fundId === f.id && e.aportacion !== "")
-      .sort((a, b) => a.date.localeCompare(b.date));
-    let running = 0;
-    fundAportadoByMonth[f.id] = {};
-    for (const e of fe) {
-      const calc = running + parseFloat(e.aportacion || 0);
-      running = (e.aportadoAcumulado !== "" && e.aportadoAcumulado != null)
-        ? parseFloat(e.aportadoAcumulado) : calc;
-      fundAportadoByMonth[f.id][e.date] = running;
-    }
-  }
+  for (const f of funds) fundAportadoByMonth[f.id] = aportadoSeries(f.id).byDate;
+
+  // Valor / aportado de la cartera por mes, arrastrando el último dato conocido por fondo
+  const valorAsOf = (fid: number, m: string) => {
+    const ms = Object.keys(fundValorByMonth[fid] || {}).filter(d => d <= m).sort();
+    return ms.length ? fundValorByMonth[fid][ms.at(-1)!] : null;
+  };
+  const aportadoAsOf = (fid: number, m: string) => {
+    const ms = Object.keys(fundAportadoByMonth[fid] || {}).filter(d => d <= m).sort();
+    return ms.length ? fundAportadoByMonth[fid][ms.at(-1)!] : 0;
+  };
+  const monthTotals: Record<string, number> = {};
   const monthAportadoAcumulado: Record<string, number> = {};
-  const monthAportacionNueva: Record<string, number> = {};
   for (const m of sortedMonthKeys) {
-    let total = 0;
-    for (const f of funds) {
-      const fMonths = Object.keys(fundAportadoByMonth[f.id] || {}).filter(fm => fm <= m).sort();
-      if (fMonths.length) total += fundAportadoByMonth[f.id][fMonths.at(-1)!];
-    }
-    monthAportadoAcumulado[m] = total;
+    let v = 0, a = 0;
+    for (const f of funds) { const vv = valorAsOf(f.id, m); if (vv !== null) v += vv; a += aportadoAsOf(f.id, m); }
+    monthTotals[m] = v;
+    monthAportadoAcumulado[m] = a;
   }
+
+  // Aportaciones nuevas por mes (para separar mercado de aportes)
+  const monthAportacionNueva: Record<string, number> = {};
   for (const e of entries) {
     if (e.aportacion === "") continue;
     monthAportacionNueva[e.date] = (monthAportacionNueva[e.date] || 0) + parseFloat(e.aportacion || 0);
   }
+
+  // Filas mensuales centralizadas (histórico + variación mensual + TWR)
+  const monthlyRows = sortedMonthKeys.map((m, i) => {
+    const prevM = i > 0 ? sortedMonthKeys[i - 1] : null;
+    const valor = monthTotals[m] || 0;
+    const aportado = monthAportadoAcumulado[m] || 0;
+    const beneficio = valor - aportado;
+    const rentPct = aportado > 0 ? (beneficio / aportado) * 100 : 0;
+    const prevValor = prevM ? (monthTotals[prevM] || 0) : null;
+    const ganMercado = prevValor !== null ? (valor - prevValor) - (monthAportacionNueva[m] || 0) : null;
+    const rentMesPct = prevValor !== null && prevValor > 0 && ganMercado !== null ? (ganMercado / prevValor) * 100 : null;
+    return { month: m, valor, aportado, beneficio, rentPct, ganMercado, rentMesPct };
+  });
+
+  // Variación mensual = solo ganancia de mercado del último mes
+  const lastRow = monthlyRows.at(-1);
+  const momMarketDiff = lastRow ? lastRow.ganMercado : null;
+  const momMarketPct  = lastRow ? lastRow.rentMesPct : null;
+
+  // Rentabilidad time-weighted (TWR): encadena los rendimientos mensuales de mercado
+  let twrFactor = 1, twrPeriods = 0;
+  for (const r of monthlyRows) {
+    if (r.rentMesPct === null) continue;
+    twrFactor *= 1 + r.rentMesPct / 100;
+    twrPeriods++;
+  }
+  const twrAcum  = twrPeriods > 0 ? (twrFactor - 1) * 100 : null;
+  const twrAnual = twrPeriods > 0 ? (Math.pow(twrFactor, 12 / twrPeriods) - 1) * 100 : null;
 
   return (
     <div style={{ fontFamily: "system-ui, sans-serif", background: "#f0f4f8", minHeight: "100vh", padding: "16px" }}>
@@ -318,9 +363,9 @@ export default function App() {
             );
           })()}
 
-          {/* Variación mensual */}
-          {momDiff !== null && (() => {
-            const pos = momDiff >= 0;
+          {/* Variación mensual (solo ganancia de mercado, sin contar aportaciones) */}
+          {momMarketDiff !== null && (() => {
+            const pos = momMarketDiff >= 0;
             return (
               <div style={{
                 background: pos ? "#f0fdf4" : "#fff1f2", borderRadius: 12, padding: "12px 18px",
@@ -330,21 +375,44 @@ export default function App() {
                 <span style={{ fontSize: 26 }}>{pos ? "📈" : "📉"}</span>
                 <div>
                   <div style={{ fontSize: 11, color: "#64748b", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 2 }}>
-                    Variación mensual &nbsp;
+                    Variación mensual (mercado) &nbsp;
                     <span style={{ fontWeight: 400, textTransform: "none", letterSpacing: 0 }}>
                       ({sortedMonthKeys.at(-2)} → {sortedMonthKeys.at(-1)})
                     </span>
                   </div>
                   <div style={{ fontSize: 20, fontWeight: 800, color: pos ? "#16a34a" : "#dc2626" }}>
-                    {pos ? "+" : ""}{fmt(momDiff)} €
-                    <span style={{ fontSize: 14, fontWeight: 600, marginLeft: 8 }}>
-                      ({pos ? "+" : ""}{fmtPct(momPctChg)})
-                    </span>
+                    {pos ? "+" : ""}{fmt(momMarketDiff)} €
+                    {momMarketPct !== null && (
+                      <span style={{ fontSize: 14, fontWeight: 600, marginLeft: 8 }}>
+                        ({pos ? "+" : ""}{fmtPct(momMarketPct)})
+                      </span>
+                    )}
                   </div>
                 </div>
               </div>
             );
           })()}
+
+          {/* Rentabilidad time-weighted (independiente de las aportaciones) */}
+          {twrAcum !== null && (
+            <div style={{
+              background: "#fff", borderRadius: 12, padding: "12px 18px", marginBottom: 16,
+              boxShadow: "0 1px 4px rgba(0,0,0,0.07)", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap"
+            }}>
+              <span style={{ fontSize: 26 }}>⏱️</span>
+              <div>
+                <div style={{ fontSize: 11, color: "#64748b", fontWeight: 600, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 2 }}>
+                  Rentabilidad de mercado (TWR)
+                </div>
+                <div style={{ fontSize: 18, fontWeight: 800, color: twrAcum >= 0 ? "#16a34a" : "#dc2626" }}>
+                  {twrAcum >= 0 ? "+" : ""}{fmtPct(twrAcum)}
+                  <span style={{ fontSize: 13, fontWeight: 600, color: "#64748b", marginLeft: 10 }}>
+                    acumulada · anualizada {twrAnual! >= 0 ? "+" : ""}{fmtPct(twrAnual!)}
+                  </span>
+                </div>
+              </div>
+            </div>
+          )}
 
           <div style={{ background: "#fff", borderRadius: 12, boxShadow: "0 2px 8px rgba(0,0,0,0.08)" }}>
             {funds.some(f => f.isin?.trim()) && (
@@ -459,20 +527,7 @@ export default function App() {
                       </tr>
                     </thead>
                     <tbody>
-                      {[...sortedMonthKeys].reverse().map((m, idx) => {
-                        const revIdx = sortedMonthKeys.length - 1 - idx;
-                        const prevM = revIdx > 0 ? sortedMonthKeys[revIdx - 1] : null;
-                        const valor = monthTotals[m] || 0;
-                        const aportado = monthAportadoAcumulado[m] || 0;
-                        const beneficio = valor - aportado;
-                        const rentPct = aportado > 0 ? (beneficio / aportado) * 100 : 0;
-                        const prevValor = prevM ? (monthTotals[prevM] || 0) : null;
-                        const ganMercado = prevValor !== null
-                          ? (valor - prevValor) - (monthAportacionNueva[m] || 0)
-                          : null;
-                        const rentMesPct = prevValor && prevValor > 0 && ganMercado !== null
-                          ? (ganMercado / prevValor) * 100
-                          : null;
+                      {[...monthlyRows].reverse().map(({ month: m, valor, aportado, beneficio, rentPct, ganMercado, rentMesPct }) => {
                         const benPos = beneficio >= 0;
                         const ganPos = ganMercado !== null ? ganMercado >= 0 : true;
                         return (
@@ -783,28 +838,21 @@ export default function App() {
         {/* GRÁFICAS TAB */}
         {activeTab === "graficas" && (() => {
           const COLORS = ["#3b5bdb","#16a34a","#f59e0b","#ef4444","#8b5cf6","#06b6d4","#f97316","#ec4899"];
-          const fundMV = {};
-          for (const e of entries) {
-            if (e.valorActual === "") continue;
-            if (!fundMV[e.fundId]) fundMV[e.fundId] = {};
-            if (!fundMV[e.fundId][e.date] || e.id > fundMV[e.fundId][e.date].id)
-              fundMV[e.fundId][e.date] = { val: parseFloat(e.valorActual), id: e.id };
-          }
-          const allMonths = Object.keys(monthTotals).sort();
+          const allMonths = sortedMonthKeys;
           const W = 580, H = 250, mL = 70, mR = 16, mT = 16, mB = 36;
           const pW = W - mL - mR, pH = H - mT - mB;
           const vals = allMonths.map(m => monthTotals[m]);
-          const allFundVals = Object.values(fundMV).flatMap(fv => Object.values(fv as Record<string, {val:number;id:number}>).map(v => v.val));
+          const allFundVals = Object.values(fundValorByMonth).flatMap(fv => Object.values(fv));
           const minV = 0;
           const maxV = (vals.length || allFundVals.length) ? Math.max(...vals, ...allFundVals, 1) * 1.05 : 1;
           const xS = i => mL + (allMonths.length > 1 ? i / (allMonths.length - 1) * pW : pW / 2);
           const yS = v => mT + pH - (v - minV) / (maxV - minV || 1) * pH;
           const totalPts = allMonths.map((m, i) => `${xS(i)},${yS(monthTotals[m])}`).join(" ");
           const fundLines = funds.map((f, fi) => {
-            const fv = fundMV[f.id] || {};
+            const fv = fundValorByMonth[f.id] || {};
             const segments = []; let seg = [];
             for (let i = 0; i < allMonths.length; i++) {
-              if (fv[allMonths[i]]) seg.push(`${xS(i)},${yS(fv[allMonths[i]].val)}`);
+              if (allMonths[i] in fv) seg.push(`${xS(i)},${yS(fv[allMonths[i]])}`);
               else if (seg.length) { segments.push(seg.join(" ")); seg = []; }
             }
             if (seg.length) segments.push(seg.join(" "));

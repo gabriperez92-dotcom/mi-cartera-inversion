@@ -64,10 +64,15 @@ Persistidos juntos bajo la clave `"investment-tracker-v1"` como `{ funds, entrie
 
 ## Lógica clave
 
-- **`fundStats(fid)`**: calcula métricas de un fondo. `valorActual` = último entry (no suma); `totalAportado` = suma de todos los entries.
+- **Criterio unificado**: una fila cuenta para el **valor** si tiene `valorActual` (aunque la aportación esté vacía) y para el **aportado** si tiene `aportacion` o un override `aportadoAcumulado`. Todas las vistas (resumen, histórico, gráficas) usan ese mismo criterio.
+- **`aportadoSeries(fid)`**: helper único que devuelve `{ total, byDate }` del aportado acumulado por fondo, honrando el override manual. Reutilizado por `fundStats` y por el histórico mensual (`fundAportadoByMonth`).
+- **`fundStats(fid)`**: `valorActual` = última entry con valor (por fecha, desempate por id); `totalAportado` = `aportadoSeries(fid).total`.
+- **`monthlyRows`**: array central por mes con `{ valor, aportado, beneficio, rentPct, ganMercado, rentMesPct }`. El valor/aportado por mes **arrastran** el último dato conocido por fondo (`valorAsOf`/`aportadoAsOf`). Lo consumen el histórico **y** la tarjeta de variación mensual (coinciden por construcción).
+- **Variación mensual**: muestra solo la **ganancia de mercado** del último mes (`ganMercado = Δvalor − aportaciones nuevas`), no el dinero aportado.
+- **TWR** (`twrAcum`/`twrAnual`): rentabilidad time-weighted que encadena los `rentMesPct` mensuales; independiente de los flujos de caja. Anualizada con `(factor)^(12/nMeses) − 1`.
+- **`newId()`**: IDs numéricos únicos y monótonos crecientes (evita colisiones de `Date.now()` en el mismo ms). Usado en `emptyEntry`, `addFund`, `addAllocation`.
 - **`persist(f, e, d)`**: único punto de escritura — actualiza state Y storage a la vez.
 - **`runningAportado`**: variable mutable fuera del JSX en la tab de aportaciones para calcular el acumulado fila a fila.
-- **Variación mensual**: compara el total de la cartera del último mes registrado con el mes anterior.
 
 ## Diseño responsive
 
